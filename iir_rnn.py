@@ -4,98 +4,169 @@ import torch.optim as optim
 import numpy as np
 import scipy.signal as signal
 import librosa
+import time
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
-# Load the system's impulse response
-filename = "wideband_audio.wav"
-audio, Fs = librosa.load(filename, sr=None)  
+# 🚀 Check GPU availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-L = 128  # Full impulse response length
-impulse_response = audio[:L] / np.max(np.abs(audio[:L]))  # Normalize
+# Enable CuDNN optimizations for speedup
+torch.backends.cudnn.benchmark = True
 
-# Generate dry signals (random noise)
-batch_size = 10
+
+# 🚀 Load the impulse response from the provided WAV file
+filename = "Mesa_OS_4x12_57_m160.wav"
+impulse_response, Fs = librosa.load(filename, sr=None)  # Keep original sampling rate
+
+L = len(impulse_response)  # Use full length (~9000 samples)
+impulse_response /= np.max(np.abs(impulse_response))  # Normalize
+
+# 🎛 Increase filter order for better approximation
+P_target, Q_target = 100, 100  # Higher-order IIR filter
+
+# 🛠 Training Hyperparameters
+batch_size = 200
 seq_len = 500  # Length of input signals
-P_target, Q_target = 6, 6  # Lower-order approximation (desired IIR order)
-num_epochs = 500
-learning_rate = 0.005
-regularization_weight = 0.01  # L1 weight to enforce lower order
+learning_rate = 0.001
+num_epochs = 5000
+regularization_weight = 0.01
 
+# 🎼 Generate dry input signals (random noise)
 x_train = np.random.randn(batch_size, seq_len)
-y_train = np.array([signal.convolve(x, impulse_response, mode='same') for x in x_train])
 
-# Convert to PyTorch tensors
-x_train_tensor = torch.tensor(x_train, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+# 🎧 Generate convolved output signals (fixed shape)
+y_train = np.array([signal.convolve(x, impulse_response, mode='same')[:seq_len] for x in x_train])  # ✅ Fixed
 
-# Define an IIR-Structured RNN for Lower-Order Approximation
+# 🔄 Convert to PyTorch tensors and move to GPU
+x_train_tensor = torch.tensor(x_train, dtype=torch.float32, device=device)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+
+# 🎯 Define an Optimized IIR-Structured RNN
 class IIRFilterRNN(nn.Module):
-    def __init__(self, P, Q):
+    def __init__(self, P, Q, seq_len):
         super(IIRFilterRNN, self).__init__()
-        self.P = P  # Lower-order Feedback (poles)
-        self.Q = Q  # Lower-order Feedforward (zeros)
+        self.P = P  # Feedback (poles)
+        self.Q = Q  # Feedforward (zeros)
+        self.seq_len = seq_len  # Ensure correct output shape
 
-        # Trainable weights representing the IIR filter coefficients
-        self.a = nn.Parameter(torch.randn(P) * 0.1)  # Poles
-        self.b = nn.Parameter(torch.randn(Q+1) * 0.1)  # Zeros
+        # Trainable weights for IIR filter coefficients
+        self.a = nn.Parameter(torch.randn(1, 1, P, device=device) * 0.1)  # Poles (feedback)
+        self.b = nn.Parameter(torch.randn(1, 1, Q+1, device=device) * 0.1)  # Zeros (feedforward)
 
     def forward(self, x):
-        batch_size, seq_len = x.shape
-        y = torch.zeros(batch_size, seq_len, device=x.device)
+        x = x.unsqueeze(1)  # Add channel dimension (batch, 1, seq_len)
 
-        for n in range(seq_len):
-            ff_sum = sum(self.b[j] * x[:, n-j] if n-j >= 0 else 0 for j in range(self.Q+1))
-            fb_sum = sum(self.a[i] * y[:, n-i-1] if n-i-1 >= 0 else 0 for i in range(self.P))
-            y[:, n] = ff_sum + fb_sum
-        
-        return y
+        # Efficient feedforward convolution (like FIR filter)
+        ff_out = F.conv1d(x, self.b, padding=self.Q)[:, :, :self.seq_len]  # Trim to correct output length
 
-# Instantiate Model with Lower Order
-model = IIRFilterRNN(P_target, Q_target)
+        # Efficient feedback convolution (IIR filter)
+        fb_out = F.conv1d(ff_out, self.a, padding=self.P-1)[:, :, :self.seq_len]  # Trim again
+
+        return fb_out.squeeze(1)  # Remove channel dim
+
+# 📌 Instantiate Model and Move to GPU
+model = IIRFilterRNN(P=P_target, Q=Q_target, seq_len=seq_len).to(device)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 loss_fn = nn.MSELoss()
 
-# Define a function to compute frequency response loss
 def frequency_loss(y_pred, y_true):
-    """ Compute the frequency response error between the model and the target RIR. """
+    """ Compute the frequency response error between the model and the target IR. """
+    
+    # Convert to float32 before applying FFT (Fix for cuFFT)
+    y_pred = y_pred.float()
+    y_true = y_true.float()
+
     y_pred_fft = torch.fft.rfft(y_pred, dim=-1)
     y_true_fft = torch.fft.rfft(y_true, dim=-1)
-    
+
     # Compare Magnitude & Phase
     mag_loss = torch.mean((torch.abs(y_pred_fft) - torch.abs(y_true_fft)) ** 2)
     phase_loss = torch.mean((torch.angle(y_pred_fft) - torch.angle(y_true_fft)) ** 2)
-    
-    return mag_loss + phase_loss
 
-# Training Loop
-for epoch in range(num_epochs):
-    optimizer.zero_grad()
-    
-    y_pred = model(x_train_tensor)
-    
-    # MSE Loss (Time Domain)
-    loss_mse = loss_fn(y_pred, y_train_tensor)
-    
-    # Frequency Domain Loss (to match impulse response)
-    loss_freq = frequency_loss(y_pred, y_train_tensor)
-    
-    # Regularization Loss to Enforce Lower-Order Approximation
-    loss_l1 = regularization_weight * (torch.sum(torch.abs(model.a)) + torch.sum(torch.abs(model.b)))
+    return mag_loss + phase_loss  # ✅ Runs in full precision
 
-    # Total Loss
-    loss = loss_mse + loss_freq + loss_l1
-    loss.backward()
-    optimizer.step()
 
-    if epoch % 50 == 0:
-        print(f"Epoch {epoch}, Loss: {loss.item()}, MSE: {loss_mse.item()}, Freq: {loss_freq.item()}, L1: {loss_l1.item()}")
-
-# Extract Poles and Zeros of the Trained Lower-Order IIR Model
 def get_poles_zeros(model):
-    a_coeffs = [1.0] + (-model.a.detach().cpu().numpy()).tolist()
-    b_coeffs = model.b.detach().cpu().numpy().tolist()
+    """Extract poles and zeros from trained IIR filter."""
+    a_coeffs = [1.0] + (-model.a.detach().cpu().numpy().flatten()).tolist()  # ✅ Convert to 1D list
+    b_coeffs = model.b.detach().cpu().numpy().flatten().tolist()  # ✅ Convert to 1D list
+
+    # Ensure coefficients are NumPy arrays
+    a_coeffs = np.array(a_coeffs, dtype=np.float64)  # ✅ Ensure correct dtype
+    b_coeffs = np.array(b_coeffs, dtype=np.float64)  # ✅ Ensure correct dtype
+
+    # Compute poles and zeros
     zeros, poles, _ = signal.tf2zpk(b_coeffs, a_coeffs)
     return zeros, poles
 
-zeros, poles = get_poles_zeros(model)
-print("Learned Zeros:", zeros)
-print("Learned Poles:", poles)
+
+# 🔬 Ensure stability by penalizing poles outside the unit circle
+def pole_stability_loss(model):
+    poles = get_poles_zeros(model)[1]  # Extract poles
+    return torch.sum(torch.clamp(torch.abs(torch.tensor(poles, device=device)) - 1, min=0))  # Penalize unstable poles
+
+# 🚀 Training Loop (Using Mixed Precision for Faster Training)
+# 🚀 Use automatic mixed precision for speedup
+scaler = torch.amp.GradScaler()  # ✅ Fixed
+
+for epoch in range(num_epochs):
+    optimizer.zero_grad()
+    
+    with torch.amp.autocast(device_type="cuda"):  # Mixed precision
+        y_pred = model(x_train_tensor)
+
+        # Compute losses
+        loss_mse = loss_fn(y_pred, y_train_tensor)  # Time domain loss
+        loss_freq = frequency_loss(y_pred, y_train_tensor)  # Frequency domain loss
+
+        # Adjust loss weighting (increase frequency loss importance)
+        loss_l1 = regularization_weight * (torch.sum(torch.abs(model.a)) + torch.sum(torch.abs(model.b)))
+        loss_stability = 10.0 * pole_stability_loss(model)
+
+        # Weight frequency loss higher than MSE
+        loss = (0.2 * loss_mse) + (3.0 * loss_freq) + loss_l1 + loss_stability  # 🔥 Increase freq loss weight
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+
+    if epoch % 50 == 0:
+        print(f"✅ Epoch {epoch} Completed! MSE: {loss_mse.item()}, Freq: {loss_freq.item()}, Total Loss: {loss.item()}")
+
+
+
+def plot_frequency_response(model, impulse_response, Fs, filename="freq_response.png"):
+    """Compute and save the frequency response plot of the trained IIR filter."""
+    
+    # Extract coefficients and ensure they are 1D NumPy arrays
+    a_coeffs = np.array([1.0] + (-model.a.detach().cpu().numpy().flatten()).tolist(), dtype=np.float64)  # ✅ Ensures proper shape
+    b_coeffs = np.array(model.b.detach().cpu().numpy().flatten(), dtype=np.float64)  # ✅ Ensures proper shape
+
+    # Debugging print
+    print(f"📏 Debugging get_poles_zeros() -> a_coeffs shape: {a_coeffs.shape}, b_coeffs shape: {b_coeffs.shape}")
+
+    # Compute frequency response of trained IIR filter
+    w, h_iir = signal.freqz(b_coeffs, a_coeffs, worN=2048, fs=Fs)
+
+    # Compute frequency response of original impulse response
+    w_rir, h_rir = signal.freqz(impulse_response, [1.0], worN=2048, fs=Fs)
+
+    # Plot the responses
+    plt.figure(figsize=(10, 5))
+    plt.plot(w, 20 * np.log10(abs(h_iir)), label="Trained IIR Filter", linestyle='dashed', color='red')
+    plt.plot(w_rir, 20 * np.log10(abs(h_rir)), label="Original Impulse Response", linestyle='solid', color='blue')
+    
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Magnitude (dB)')
+    plt.title('Frequency Response Comparison')
+    plt.legend()
+    plt.grid()
+
+    # Save instead of showing the plot
+    plt.savefig(filename, dpi=300)
+    print(f"✅ Saved frequency response plot as {filename}")
+
+plot_frequency_response(model, impulse_response, Fs)
